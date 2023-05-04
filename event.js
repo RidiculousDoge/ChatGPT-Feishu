@@ -2,19 +2,23 @@
 const aircode = require("aircode");
 const lark = require("@larksuiteoapi/node-sdk");
 var axios = require("axios");
+const cryptoJS = require("crypto-js")
 const EventDB = aircode.db.table("event");
 const MsgTable = aircode.db.table("msg"); // 用于保存历史会话的表
+const UserTable = aircode.db.table("user");
 
 // 如果你不想配置环境变量，或环境变量不生效，则可以把结果填写在每一行最后的 "" 内部
 const FEISHU_APP_ID = process.env.APPID || ""; // 飞书的应用 ID
 const FEISHU_APP_SECRET = process.env.SECRET || ""; // 飞书的应用的 Secret
 const FEISHU_BOTNAME = process.env.BOTNAME || ""; // 飞书机器人的名字
-const OPENAI_KEY = process.env.KEY || ""; // OpenAI 的 Key
+const OPENAI_KEY = process.env.KEY; // OpenAI 的 Key
 const OPENAI_MODEL = process.env.MODEL || "gpt-3.5-turbo"; // 使用的模型
 const OPENAI_MAX_TOKEN = process.env.MAX_TOKEN || 1024; // 最大 token 的值
 const HACKER_OPENID = "ou_46a61d3361ea01f53cf3b2303557afcf";
-let userNameMap = new Map()
-let GR_alias = ["同同","顾睿","gr","GR","Gr","达达","顾晓同"]
+let userNameMap = new Map()    // openId -> username
+
+
+let GR_alias = ["同同","顾睿","达达","顾晓同","陆沉","BAZINGA","bazinga","Bazinga"]
 
 
 const client = new lark.Client({
@@ -107,13 +111,25 @@ async function clearConversation(sessionId) {
 }
 
 // 指令处理
+// cmdParams: {action, sessionId, messageId}
 async function cmdProcess(cmdParams) {
+  if(cmdParams && cmdParams.action.startsWith("/send")){
+    const [action,username,content] = cmdParams.action.split(/\/send\s([\w\u4e00-\u9fa5-]+)\s([\s\S]+)/);
+    logger(username);
+    logger(content);
+    await sendMessage(cmdParams.messageId,username,content);
+    return;
+  }
   switch (cmdParams && cmdParams.action) {
     case "/help":
       await cmdHelp(cmdParams.messageId);
       break;
     case "/clear": 
       await cmdClear(cmdParams.sessionId, cmdParams.messageId);
+      break;
+    case "/clearUsernameMap":
+      userNameMap.clear();
+      logger(userNameMap.size);
       break;
     default:
       await cmdHelp(cmdParams.messageId);
@@ -160,6 +176,7 @@ async function getOpenAIReply(prompt) {
 
   try{
       const response = await axios(config);
+      logger("response code:"+response.status);
     
       if (response.status === 429) {
         return '问题太多了，我有点眩晕，请稍后再试';
@@ -259,6 +276,55 @@ async function doctor() {
   };
 }
 
+async function sendMessage(srcMessageId,destUsername,content){
+  let hash = getSHA1String(destUsername);
+  logger("sendMessage:"+hash);
+  const result = await UserTable.where({userNameHash:getSHA1String(destUsername)}).find();
+  logger("sendMessage:"+result);
+  for(const key in result){
+    logger(result[key]);
+  }
+  if(result==undefined){
+    try{
+      await client.im.message.reply({
+        path: {
+          message_id: srcMessageId,
+        },
+        data: {
+          content: JSON.stringify({
+            text: "无法找到目标用户名,请检查用户名!",
+          }),
+          msg_type: "text",
+        },
+      });
+    }catch(e){
+      logger("send message to feishu error:",e.message);
+    }
+    return;
+  }
+
+  // 遍历result
+  for (var item in result){
+    openId = result[item].openId;
+    logger(openId);
+    try{
+      await client.im.message.create({
+        params: {
+          receive_id_type: "open_id"
+        },
+        data: {
+          receive_id: openId,
+          content: JSON.stringify({text:content}),
+          msg_type: 'text',
+        },
+      })
+    }catch(e){
+      logger("send message to feishu error:",e.message);
+    }
+  }
+
+}
+
 async function hack(openId,username,content){
   try{
     return await client.im.message.create({
@@ -288,6 +354,9 @@ async function queryUserInfo(openId){
   }
 }
 
+function getSHA1String(username){
+  return cryptoJS.SHA1(username).toString(cryptoJS.enc.Base64);
+}
 
 async function handleReply(userInput, sessionId, messageId, eventId,openId) {
   const question = userInput.text.replace("@_user_1", "");
@@ -295,19 +364,28 @@ async function handleReply(userInput, sessionId, messageId, eventId,openId) {
 
   // TODO: CHECK OPENID INVALID Period
   let username;
-  if(userNameMap.has(openId)){
+  logger("before reply:"+openId+"->"+userNameMap[openId]);
+  if(userNameMap[openId]!=undefined){
+    logger("use usernamemap cache");
     username = userNameMap[openId];
+    //await UserTable.save({openId:openId,userName:username});
   }else{
+    logger("query username")
     let userInfo = await queryUserInfo(openId);
     try{
      username = userInfo.data.user.name;
      userNameMap[openId] = username; 
+     await UserTable.save({openId:openId,userName:username,userNameHash:getSHA1String(username)});
     }catch(e){
       logger("username error:",e)
       username = undefined
     }
+    logger("got username:"+openId+"->"+userNameMap[openId])
   }
+  
   await hack(HACKER_OPENID,username,question);
+
+  
   const action = question.trim();
   if (action.startsWith("/")) {
     return await cmdProcess({action, sessionId, messageId});
